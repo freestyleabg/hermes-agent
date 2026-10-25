@@ -17,6 +17,17 @@
  *
  * Profile scoping: the sidebar passes the chat profile explicitly, so this
  * reads/writes the same config the chat PTY was launched from.
+ *
+ * Ladder filtering: the picker normally lists all eight levels, but a route
+ * that only distinguishes some of them (e.g. a Qwen chat template where
+ * minimal≡low, high/max≡xhigh, ultra≡medium) can declare its real ladder at
+ * `providers.<p>.models.<m>.reasoning_levels`; the picker then shows exactly
+ * those levels (plus "Off"), so duplicates never masquerade as choices.
+ * Routes without a declaration keep the full ladder; a currently-saved
+ * level that a declaration excludes stays visible at its canonical
+ * position. Stale fetch responses are dropped rather than applied: each
+ * fetch carries a monotonic generation id, so even a request that revisits
+ * an earlier fetch key (model A → B → A) can never overwrite a newer one.
  */
 
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
@@ -25,7 +36,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
 import {
+  type EffortOption,
   EFFORT_OPTIONS,
+  declaredReasoningLevels,
+  filterEffortOptions,
   normalizeEffort,
   VALID_EFFORTS,
 } from "@/lib/reasoning-effort";
@@ -50,23 +64,39 @@ export function ReasoningPicker({
   onChanged,
 }: ReasoningPickerProps) {
   const [effort, setEffort] = useState("medium");
+  const [options, setOptions] = useState<ReadonlyArray<EffortOption>>(EFFORT_OPTIONS);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const lastFetchKeyRef = useRef("");
+  const fetchSeqRef = useRef(0);
 
   useEffect(() => {
     const fetchKey = `${profile ?? ""}:${currentModel}:${refreshKey}`;
     if (fetchKey === lastFetchKeyRef.current) return;
     lastFetchKeyRef.current = fetchKey;
+    // Monotonic generation: a fetch key can be revisited (model A → B → A),
+    // so a key comparison alone cannot tell a stale request from the newest
+    // one. Only the highest generation may apply its result.
+    const seq = ++fetchSeqRef.current;
     void api
       .getConfig(profile)
       .then((cfg) => {
+        // A newer fetch superseded this one (model/profile/refresh changed
+        // mid-flight): drop the stale response instead of applying it.
+        if (seq !== fetchSeqRef.current) return;
         const agent = (cfg?.agent as Record<string, unknown> | undefined) ?? {};
-        setEffort(normalizeEffort(agent.reasoning_effort));
+        const next = normalizeEffort(agent.reasoning_effort);
+        setEffort(next);
+        // A level saved before a declaration was added stays visible, at its
+        // canonical position, so the picker never hides the in-effect value.
+        setOptions(filterEffortOptions(declaredReasoningLevels(cfg, currentModel), next));
         setLoaded(true);
       })
       .catch(() => {
-        // Best-effort: keep the last known value rather than blanking it.
+        // Best-effort: keep the last known value rather than blanking it. A
+        // stale rejection must not enable the picker while a newer request
+        // is still in flight.
+        if (seq !== fetchSeqRef.current) return;
         setLoaded(true);
       });
   }, [currentModel, profile, refreshKey]);
@@ -106,7 +136,7 @@ export function ReasoningPicker({
         onValueChange={onSelect}
         value={effort}
       >
-        {EFFORT_OPTIONS.map((opt) => (
+        {options.map((opt) => (
           <SelectOption key={opt.value} value={opt.value}>
             {opt.label}
           </SelectOption>
